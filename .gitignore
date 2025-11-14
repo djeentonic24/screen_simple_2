@@ -1,0 +1,36 @@
+# CubeIDE
+Debug/
+Release/
+*.launch
+.settings/
+.metadata/
+
+# Build artifacts
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.axf
+
+# CubeMX
+*.ioc
+.mxproject
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System files
+*.log
+*.tmp
+
+# Dependencies
+Drivers/CMSIS/Lib/
+Middlewares/
