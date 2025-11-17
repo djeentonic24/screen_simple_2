@@ -56,7 +56,7 @@ typedef enum
 #define PACKET_OVERHEAD_SIZE    (PACKET_HEADER_SIZE + PACKET_TRAILER_SIZE - 1)
 #define PACKET_SIZE             ((uint32_t)128)
 #define PACKET_1K_SIZE          ((uint32_t)1024)
-#define USER_FLASH_SIZE      (uint32_t)(1024*1024 - 128*1024)   // если флеш 1 МБ
+#define USER_FLASH_SIZE      (uint32_t)(1024*1024 - 128*1024)   // если флеш 1 МБ. ADDED ACCORDING TO CHATGPT. TODO: USE AN APPROPRIATE VARIABLE. NO MAGIC NUMBERS
 
 /* /-------- Packet in IAP memory ------------------------------------------\
  * | 0      |  1    |  2     |  3   |  4      | ... | n+4     | n+5  | n+6  | 

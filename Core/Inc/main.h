@@ -43,10 +43,10 @@ extern SPI_HandleTypeDef hspi2;  // SPI1 настроен через CubeMX
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
-#define DCDC_DT     (1.0f / 20000.0f)
+#define DCDC_DT     (1.0f / 10000.0f)
 #define DCDC_VIN    12.0f
 #define DCDC_RLOAD  10.0f
-#define DCDC_C      4700e-6f
+#define DCDC_C      470000e-6f
 
 typedef struct {
     float Kp;       // Пропорциональный коэффициент

@@ -24,6 +24,7 @@
 #include "ymodem.h"
 #include "string.h"
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
