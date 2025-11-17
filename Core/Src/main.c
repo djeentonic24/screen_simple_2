@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include "FreeRTOS.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -27,6 +28,7 @@
 #include "task.h"
 #include "lfs.h"
 #include "nor.h"
+#include "ymodem.h"
 
 LV_IMG_DECLARE(picture);
 /* USER CODE END Includes */
@@ -60,6 +62,13 @@ osThreadId TaskDrawHandle;
 osThreadId TaskDCDCHandle;
 osThreadId TaskLittleFSHandle;
 /* USER CODE BEGIN PV */
+
+// Logging variables
+uint8_t logging_enabled = 0;
+uint32_t log_interval_ms = 1000; // Log every 1 second
+uint32_t last_log_time = 0;
+uint32_t log_sequence = 0;
+
 // Переменные системы управления DCDC
 float Vout = 0.0f;              // Выходное напряжение
 volatile float Device_temp = 25.0f; // Температура устройства
@@ -90,6 +99,7 @@ void littlefs_config_init(void);
 nor_err_e nor_init(void);
 /* USER CODE END PV */
 
+
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -104,7 +114,12 @@ void Start_TaskDCDC(void const * argument);
 void Start_TaskLittleFS(void const * argument);
 
 /* USER CODE BEGIN PFP */
-void list_files(const char *path); // Функция для листинга файлов
+
+/* USER CODE BEGIN PFP */
+void start_logging(void);
+void stop_logging(void);
+void log_data_point(void);
+void create_log_file(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -177,7 +192,7 @@ int main(void)
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* definition and creation of TaskDraw */
-  osThreadDef(TaskDraw, Start_TaskDraw, osPriorityAboveNormal, 0, 1024);
+  osThreadDef(TaskDraw, Start_TaskDraw, osPriorityLow, 0, 1024);
   TaskDrawHandle = osThreadCreate(osThread(TaskDraw), NULL);
 
   /* definition and creation of TaskDCDC */
@@ -185,7 +200,7 @@ int main(void)
   TaskDCDCHandle = osThreadCreate(osThread(TaskDCDC), NULL);
 
   /* definition and creation of TaskLittleFS */
-  osThreadDef(TaskLittleFS, Start_TaskLittleFS, osPriorityLow, 0, 1024);
+  osThreadDef(TaskLittleFS, Start_TaskLittleFS, osPriorityAboveNormal, 0, 1024);
   TaskLittleFSHandle = osThreadCreate(osThread(TaskLittleFS), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -361,7 +376,7 @@ static void MX_TIM3_Init(void)
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim3.Init.Period = 8999;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
   {
     Error_Handler();
@@ -497,6 +512,535 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+  * @brief Check filesystem health
+  */
+void check_filesystem_health(void) {
+    char msg[100];
+
+    // Проверяем корневую директорию
+    lfs_dir_t dir;
+    if (lfs_dir_open(&lfs, &dir, "/") == LFS_ERR_OK) {
+        snprintf(msg, sizeof(msg), "Root directory OK\r\n");
+        lfs_dir_close(&lfs, &dir);
+    } else {
+        snprintf(msg, sizeof(msg), "Root directory FAILED\r\n");
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // Проверяем директорию /data
+    if (lfs_dir_open(&lfs, &dir, "/data") == LFS_ERR_OK) {
+        snprintf(msg, sizeof(msg), "/data directory OK\r\n");
+        lfs_dir_close(&lfs, &dir);
+    } else {
+        snprintf(msg, sizeof(msg), "/data directory FAILED, creating...\r\n");
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        lfs_mkdir(&lfs, "/data");
+    }
+}
+
+/**
+  * @brief Start data logging to CSV file
+  */
+void start_logging(void) {
+    logging_enabled = 1;
+    log_sequence = 0;
+
+    // Create new log file with timestamp
+    create_log_file();
+
+    // Write CSV header
+    lfs_file_t log_file;
+    if (lfs_file_open(&lfs, &log_file, "/data/datalog.csv", LFS_O_WRONLY | LFS_O_APPEND) == LFS_ERR_OK) {
+        const char *header = "Timestamp(ms),Sequence,Vref(V),Vout(V),Temp(C),Duty(%),Control\r\n";
+        lfs_file_write(&lfs, &log_file, header, strlen(header));
+        lfs_file_close(&lfs, &log_file);
+    }
+
+    char msg[100];
+    snprintf(msg, sizeof(msg), "Logging STARTED: /data/datalog.csv\r\n");
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+/**
+  * @brief Stop data logging
+  */
+void stop_logging(void) {
+    logging_enabled = 0;
+    HAL_UART_Transmit(&huart2, (uint8_t*)"Logging STOPPED\r\n", 17, HAL_MAX_DELAY);
+}
+
+/**
+  * @brief Create new log file with timestamp
+  */
+void create_log_file(void) {
+    char filename[50] = "/data/datalog.csv";
+
+    // Сначала убедимся, что директория существует
+    lfs_mkdir(&lfs, "/data");
+
+    // Создаем файл и сразу пишем заголовок
+    lfs_file_t log_file;
+    int ret = lfs_file_open(&lfs, &log_file, filename, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (ret == LFS_ERR_OK) {
+        const char *header = "Timestamp(ms),Sequence,Vref(V),Vout(V),Temp(C),Duty(%),Control\r\n";
+        lfs_file_write(&lfs, &log_file, header, strlen(header));
+        lfs_file_close(&lfs, &log_file);
+
+        char msg[100];
+        snprintf(msg, sizeof(msg), "Log file created: %s\r\n", filename);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    } else {
+        char msg[100];
+        snprintf(msg, sizeof(msg), "ERROR creating log file: %d\r\n", ret);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+}
+
+/**
+  * @brief Log one data point to CSV
+  */
+void log_data_point(void) {
+    if (!logging_enabled) return;
+
+    char filename[50] = "/data/datalog.csv";
+
+    lfs_file_t log_file;
+    int ret = lfs_file_open(&lfs, &log_file, filename, LFS_O_WRONLY | LFS_O_APPEND | LFS_O_CREAT);
+    if (ret != LFS_ERR_OK) {
+        char msg[100];
+        snprintf(msg, sizeof(msg), "ERROR opening log file: %d, recreating...\r\n", ret);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+        // Пытаемся пересоздать файл
+        create_log_file();
+        return;
+    }
+
+    char log_line[256];
+    float duty_percent = (duty_last / 9000.0f) * 100.0f;
+
+    snprintf(log_line, sizeof(log_line), "%lu,%lu,%.3f,%.3f,%.2f,%.1f,%.3f\r\n",
+             HAL_GetTick(),
+             log_sequence,
+             Vref,
+             Vout,
+             Device_temp,
+             duty_percent,
+             control);
+
+    ret = lfs_file_write(&lfs, &log_file, log_line, strlen(log_line));
+    if (ret < 0) {
+        char msg[100];
+        snprintf(msg, sizeof(msg), "ERROR writing log: %d\r\n", ret);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+
+    // Важно: sync перед закрытием!
+    lfs_file_sync(&lfs, &log_file);
+    lfs_file_close(&lfs, &log_file);
+
+    // Отладочный вывод
+    if (log_sequence % 5 == 0) {
+        char msg[100];
+        snprintf(msg, sizeof(msg), "Logged #%lu: Vout=%.2f\r\n", log_sequence, Vout);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+
+    log_sequence++;
+}
+
+/**
+  * @brief Send log file via XMODEM
+  */
+void send_log_file_xmodem(void) {
+    char msg[100];
+    lfs_file_t file;
+
+    // Check if log file exists
+    if (lfs_file_open(&lfs, &file, "/data/datalog.csv", LFS_O_RDONLY) != LFS_ERR_OK) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"No log file found\r\n", 19, HAL_MAX_DELAY);
+        return;
+    }
+
+    uint32_t file_size = lfs_file_size(&lfs, &file);
+    lfs_file_close(&lfs, &file);
+
+    if (file_size == 0) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"Log file is empty\r\n", 19, HAL_MAX_DELAY);
+        return;
+    }
+
+    snprintf(msg, sizeof(msg), "Log file size: %lu bytes\r\n", file_size);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // Send via XMODEM
+    send_file_xmodem("/data/datalog.csv");
+}
+
+
+static int load_file_into_ram(const char *path, uint8_t **buffer, uint32_t *file_size) {
+    lfs_file_t file;
+    char msg[100];
+
+    if (lfs_file_open(&lfs, &file, path, LFS_O_RDONLY) != LFS_ERR_OK) {
+        snprintf(msg, sizeof(msg), "YMODEM: cannot open %s\r\n", path);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        return -1;
+    }
+
+    lfs_soff_t size = lfs_file_size(&lfs, &file);
+    if (size <= 0) {
+        snprintf(msg, sizeof(msg), "YMODEM: empty file %s\r\n", path);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        lfs_file_close(&lfs, &file);
+        return -2;
+    }
+
+    uint8_t *ram = pvPortMalloc(size);
+    if (ram == NULL) {
+        snprintf(msg, sizeof(msg), "YMODEM: no RAM for %s (%ld bytes)\r\n", path, (long)size);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        lfs_file_close(&lfs, &file);
+        return -3;
+    }
+
+    lfs_file_rewind(&lfs, &file);
+    int read = lfs_file_read(&lfs, &file, ram, size);
+    lfs_file_close(&lfs, &file);
+
+    if (read < 0 || (lfs_soff_t)read != size) {
+        snprintf(msg, sizeof(msg), "YMODEM: read error %s (%d)\r\n", path, read);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        vPortFree(ram);
+        return -4;
+    }
+
+    *buffer = ram;
+    *file_size = (uint32_t)size;
+    return 0;
+}
+
+static int send_file_with_ymodem(const char *path) {
+    uint8_t *buffer = NULL;
+    uint32_t file_size = 0;
+    char msg[128];
+
+    if (load_file_into_ram(path, &buffer, &file_size) != 0) {
+        return 0;
+    }
+
+    const char *name_only = strrchr(path, '/');
+    if (name_only && *(name_only + 1) != '\0') {
+        name_only++;
+    } else {
+        name_only = path;
+    }
+
+    snprintf(msg, sizeof(msg), "YMODEM send: %s (%lu bytes)\r\n", name_only, file_size);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    COM_StatusTypeDef status = Ymodem_Transmit(buffer, (const uint8_t*)name_only, file_size);
+    vPortFree(buffer);
+
+    if (status == COM_OK) {
+        snprintf(msg, sizeof(msg), "YMODEM OK: %s\r\n", name_only);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        return 1;
+    } else {
+        snprintf(msg, sizeof(msg), "YMODEM FAIL (%d): %s\r\n", status, name_only);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        return 0;
+    }
+}
+
+static int send_directory_with_ymodem(const char *dir_path) {
+    lfs_dir_t dir;
+    struct lfs_info info;
+    int sent = 0;
+
+    if (lfs_dir_open(&lfs, &dir, dir_path) != LFS_ERR_OK) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "YMODEM: cannot open %s\r\n", dir_path);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        return 0;
+    }
+
+    while (lfs_dir_read(&lfs, &dir, &info) > 0) {
+        if (info.type != LFS_TYPE_REG) {
+            continue;
+        }
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+
+        char filepath[64];
+        if (strcmp(dir_path, "/") == 0) {
+            snprintf(filepath, sizeof(filepath), "/%s", info.name);
+        } else {
+            snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, info.name);
+        }
+
+        sent += send_file_with_ymodem(filepath);
+        osDelay(200);
+    }
+
+    lfs_dir_close(&lfs, &dir);
+    return sent;
+}
+
+void send_file_ymodem_working(void) {
+    char msg[80];
+    int total = 0;
+
+    snprintf(msg, sizeof(msg), "=== YMODEM BATCH TRANSFER (RAM buffered) ===\r\n");
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    total += send_directory_with_ymodem("/");
+    total += send_directory_with_ymodem("/data");
+
+    if (total == 0) {
+        snprintf(msg, sizeof(msg), "YMODEM: no files found\r\n");
+    } else {
+        snprintf(msg, sizeof(msg), "YMODEM complete: %d file(s)\r\n", total);
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+/**
+  * @brief Working XMODEM file send for Tera Term
+  */
+void send_file_xmodem(const char *filename) {
+    char msg[100];
+    lfs_file_t file;
+    uint8_t packet[132];
+    uint8_t buffer[128];
+    int bytes_read;
+    uint8_t block_num = 1;
+    uint32_t total_bytes = 0;
+
+    // Open file
+    if (lfs_file_open(&lfs, &file, filename, LFS_O_RDONLY) != LFS_ERR_OK) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"ERROR: Cannot open file\r\n", 24, HAL_MAX_DELAY);
+        return;
+    }
+
+    uint32_t file_size = lfs_file_size(&lfs, &file);
+    snprintf(msg, sizeof(msg), "XMODEM Send: %s (%lu bytes)\r\n", filename, file_size);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // Calculate how many full packets needed
+    uint16_t total_packets = (file_size + 127) / 128;
+    snprintf(msg, sizeof(msg), "Total packets: %d\r\n", total_packets);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)"Start transfer in 10 seconds...\r\n", 31, HAL_MAX_DELAY);
+    osDelay(10000);
+
+    // Send all packets
+    for (uint16_t pkt = 0; pkt < total_packets; pkt++) {
+        bytes_read = lfs_file_read(&lfs, &file, buffer, 128);
+        total_bytes += bytes_read;
+
+        // Prepare packet
+        packet[0] = 0x01; // SOH
+        packet[1] = block_num;
+        packet[2] = 255 - block_num;
+
+        // Copy actual data
+        memcpy(&packet[3], buffer, bytes_read);
+
+        // Fill remainder with zeros (not 0x1A!)
+        if (bytes_read < 128) {
+            memset(&packet[3 + bytes_read], 0, 128 - bytes_read);
+        }
+
+        // Calculate checksum
+        uint8_t checksum = 0;
+        for (int i = 0; i < 128; i++) {
+            checksum += packet[3 + i];
+        }
+        packet[131] = checksum;
+
+        // Send packet
+        HAL_UART_Transmit(&huart2, packet, 132, HAL_MAX_DELAY);
+
+        // Progress
+        snprintf(msg, sizeof(msg), "Packet %d/%d sent (%lu bytes)\r\n",
+                pkt + 1, total_packets, total_bytes);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+        block_num++;
+        if (block_num == 0) block_num = 1;
+
+        osDelay(100); // Delay between packets
+    }
+
+    // Send EOT
+    uint8_t eot = 0x04;
+    HAL_UART_Transmit(&huart2, &eot, 1, HAL_MAX_DELAY);
+
+    snprintf(msg, sizeof(msg), "Transfer complete: %lu bytes\r\n", total_bytes);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    lfs_file_close(&lfs, &file);
+}
+/**
+  * @brief Simple file send for Tera Term
+  */
+void send_file_teraterm(const char *filename) {
+    char msg[100];
+    lfs_file_t file;
+    uint8_t buffer[256];
+    int bytes_read;
+    uint32_t total_sent = 0;
+
+    // Open file
+    if (lfs_file_open(&lfs, &file, filename, LFS_O_RDONLY) != LFS_ERR_OK) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"ERROR: Cannot open file\r\n", 24, HAL_MAX_DELAY);
+        return;
+    }
+
+    uint32_t file_size = lfs_file_size(&lfs, &file);
+
+    // Send file info first
+    snprintf(msg, sizeof(msg), "FILE:%s SIZE:%lu\r\n", filename, file_size);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // Small delay to let Tera Term prepare
+    osDelay(100);
+
+    // Send file content directly (Tera Term can save this as binary)
+    while ((bytes_read = lfs_file_read(&lfs, &file, buffer, sizeof(buffer))) > 0) {
+        HAL_UART_Transmit(&huart2, buffer, bytes_read, HAL_MAX_DELAY);
+        total_sent += bytes_read;
+
+        // Small delay to prevent buffer overrun
+        osDelay(5);
+    }
+
+    // Send completion marker
+    snprintf(msg, sizeof(msg), "\r\n=== FILE END: %s, %lu bytes ===\r\n", filename, total_sent);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    lfs_file_close(&lfs, &file);
+}
+
+/**
+  * @brief Send file as hex dump (human readable)
+  */
+void send_file_hexdump(const char *filename) {
+    char msg[100];
+    lfs_file_t file;
+    uint8_t buffer[16];
+    int bytes_read;
+    uint32_t offset = 0;
+
+    if (lfs_file_open(&lfs, &file, filename, LFS_O_RDONLY) != LFS_ERR_OK) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"ERROR: Cannot open file\r\n", 24, HAL_MAX_DELAY);
+        return;
+    }
+
+    uint32_t file_size = lfs_file_size(&lfs, &file);
+    snprintf(msg, sizeof(msg), "=== HEX DUMP: %s (%lu bytes) ===\r\n", filename, file_size);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    while ((bytes_read = lfs_file_read(&lfs, &file, buffer, 16)) > 0) {
+        // Print offset
+        snprintf(msg, sizeof(msg), "%08lX: ", offset);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+        // Print hex values
+        for (int i = 0; i < 16; i++) {
+            if (i < bytes_read) {
+                snprintf(msg, sizeof(msg), "%02X ", buffer[i]);
+            } else {
+                snprintf(msg, sizeof(msg), "   ");
+            }
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        }
+
+        // Print ASCII values
+        HAL_UART_Transmit(&huart2, (uint8_t*)" ", 1, HAL_MAX_DELAY);
+        for (int i = 0; i < bytes_read; i++) {
+            if (buffer[i] >= 32 && buffer[i] <= 126) {
+                snprintf(msg, sizeof(msg), "%c", buffer[i]);
+            } else {
+                snprintf(msg, sizeof(msg), ".");
+            }
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        }
+
+        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+        offset += bytes_read;
+        osDelay(10);
+    }
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)"=== END OF DUMP ===\r\n", 21, HAL_MAX_DELAY);
+    lfs_file_close(&lfs, &file);
+}
+
+/**
+  * @brief Receive file from Tera Term (simple version)
+  */
+void receive_file_teraterm(const char *filename) {
+    char msg[100];
+    lfs_file_t file;
+    uint8_t buffer[128];
+    uint32_t total_received = 0;
+    uint32_t start_time = HAL_GetTick();
+
+    snprintf(msg, sizeof(msg), "READY to receive file: %s\r\n", filename);
+    snprintf(msg, sizeof(msg), "Send file data now. Press Ctrl+C in Tera Term to cancel.\r\n");
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // Open file for writing
+    if (lfs_file_open(&lfs, &file, filename, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) != LFS_ERR_OK) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"ERROR: Cannot create file\r\n", 26, HAL_MAX_DELAY);
+        return;
+    }
+
+    // Receive data for 30 seconds or until no data for 2 seconds
+    uint32_t last_data_time = HAL_GetTick();
+
+    while ((HAL_GetTick() - start_time < 30000) && (HAL_GetTick() - last_data_time < 2000)) {
+        int bytes_received = 0;
+
+        // Try to receive data
+        for (int i = 0; i < sizeof(buffer); i++) {
+            uint8_t ch;
+            if (HAL_UART_Receive(&huart2, &ch, 1, 50) == HAL_OK) {
+                buffer[bytes_received++] = ch;
+                last_data_time = HAL_GetTick();
+            } else {
+                break; // No more data
+            }
+        }
+
+        if (bytes_received > 0) {
+            lfs_file_write(&lfs, &file, buffer, bytes_received);
+            total_received += bytes_received;
+
+            // Progress every 1KB
+            if (total_received % 1024 == 0) {
+                snprintf(msg, sizeof(msg), "Received: %lu bytes\r\n", total_received);
+                HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+            }
+        }
+
+        osDelay(10);
+    }
+
+    snprintf(msg, sizeof(msg), "FILE RECEIVED: %s, %lu bytes\r\n", filename, total_received);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    lfs_file_close(&lfs, &file);
+}
+
+
+
+
 /**
   * @brief Инициализация ПИ-регулятора
   * @param pi: указатель на структуру ПИ-регулятора
@@ -680,6 +1224,77 @@ void nor_delay_us(uint32_t us) {
         __NOP();
     }
 }
+
+void send_file_list(void) {
+    char msg[100];
+    lfs_dir_t dir;
+    struct lfs_info info;
+    int file_count = 0;
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)"=== Available Files ===\r\n", 25, HAL_MAX_DELAY);
+
+    // List root directory
+    if (lfs_dir_open(&lfs, &dir, "/") == LFS_ERR_OK) {
+        while (lfs_dir_read(&lfs, &dir, &info) > 0) {
+            if (info.type == LFS_TYPE_REG) {
+                snprintf(msg, sizeof(msg), "ROOT: %s (%lu bytes)\r\n", info.name, info.size);
+                HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+                file_count++;
+            }
+        }
+        lfs_dir_close(&lfs, &dir);
+    }
+
+    // List /data directory
+    if (lfs_dir_open(&lfs, &dir, "/data") == LFS_ERR_OK) {
+        while (lfs_dir_read(&lfs, &dir, &info) > 0) {
+            if (info.type == LFS_TYPE_REG) {
+                snprintf(msg, sizeof(msg), "DATA: %s (%lu bytes)\r\n", info.name, info.size);
+                HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+                file_count++;
+            }
+        }
+        lfs_dir_close(&lfs, &dir);
+    }
+
+    snprintf(msg, sizeof(msg), "Total files: %d\r\n", file_count);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+/**
+  * @brief Receive filename from UART
+  */
+int receive_filename(char *filename, int max_len) {
+    char msg[100];
+    uint8_t ch;
+    int idx = 0;
+    uint32_t timeout = 5000; // 5 second timeout
+    uint32_t start = HAL_GetTick();
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)"Enter filename: ", 16, HAL_MAX_DELAY);
+
+    while (HAL_GetTick() - start < timeout) {
+        if (HAL_UART_Receive(&huart2, &ch, 1, 10) == HAL_OK) {
+            if (ch == '\r' || ch == '\n') {
+                filename[idx] = '\0';
+                if (idx > 0) {
+                    snprintf(msg, sizeof(msg), "OK: %s\r\n", filename);
+                    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+                    return 0; // Success
+                }
+            } else if (ch >= 32 && ch <= 126 && idx < max_len - 1) { // Printable chars
+                filename[idx++] = ch;
+                // Echo character
+                HAL_UART_Transmit(&huart2, &ch, 1, HAL_MAX_DELAY);
+            }
+        }
+        osDelay(1);
+    }
+
+    HAL_UART_Transmit(&huart2, (uint8_t*)"Timeout!\r\n", 10, HAL_MAX_DELAY);
+    return -1; // Timeout
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -776,7 +1391,7 @@ void Start_TaskDraw(void const * argument)
 
     // Обработка событий LVGL
     lv_timer_handler();
-    osDelay(50); // Обновление каждые 50 мс
+    osDelay(25); // Обновление каждые 50 мс
   }
   /* USER CODE END Start_TaskDraw */
 }
@@ -806,22 +1421,28 @@ void Start_TaskDCDC(void const * argument)
 	}
 	last_button = btn;
 
-	// Обновление ПИ-регулятора
-	control = PI_Update(&pi, Vref, Vout, DCDC_DT);
+//	// Обновление ПИ-регулятора
+//	control = PI_Update(&pi, Vref, Vout, DCDC_DT);
+//
+//	// Ограничение управляющего сигнала
+//	if (control > DCDC_VIN) control = DCDC_VIN;
+//	if (control < 0.0f)     control = 0.0f;
+//
+//	// Расчет скважности ШИМ
+//	uint16_t duty = (uint16_t)((control / DCDC_VIN) * __HAL_TIM_GET_AUTORELOAD(&htim3));
+//	duty_last = duty;
+//
+//	// Моделирование DCDC преобразователя и тепловых процессов
+//	float P_heat = Vout * Vout / DCDC_RLOAD;
+//	float P_cool = 0.1f * (Device_temp - 20.0f);
+//	Device_temp += 100.0f * DCDC_DT * (P_heat - P_cool);
+//	Vout += DCDC_DT * ((DCDC_VIN * duty / __HAL_TIM_GET_AUTORELOAD(&htim3)) - Vout / DCDC_RLOAD) / DCDC_C;
 
-	// Ограничение управляющего сигнала
-	if (control > DCDC_VIN) control = DCDC_VIN;
-	if (control < 0.0f)     control = 0.0f;
-
-	// Расчет скважности ШИМ
-	uint16_t duty = (uint16_t)((control / DCDC_VIN) * __HAL_TIM_GET_AUTORELOAD(&htim3));
-	duty_last = duty;
-
-	// Моделирование DCDC преобразователя и тепловых процессов
-	float P_heat = Vout * Vout / DCDC_RLOAD;
-	float P_cool = 0.1f * (Device_temp - 20.0f);
-	Device_temp += 100.0f * DCDC_DT * (P_heat - P_cool);
-	Vout += DCDC_DT * ((DCDC_VIN * duty / __HAL_TIM_GET_AUTORELOAD(&htim3)) - Vout / DCDC_RLOAD) / DCDC_C;
+    // Data logging
+    if (logging_enabled && (HAL_GetTick() - last_log_time >= log_interval_ms)) {
+        last_log_time = HAL_GetTick();
+        log_data_point();
+    }
 
 	osDelay(1); // Высокая частота обновления
   }
@@ -838,141 +1459,249 @@ void Start_TaskDCDC(void const * argument)
 void Start_TaskLittleFS(void const * argument)
 {
   /* USER CODE BEGIN Start_TaskLittleFS */
-	  char msg[100];
-	  int err;
-	  static uint32_t counter = 0;
-	  static uint32_t last_save = 0;
+	   char msg[100];
+	    int err;
+	    static uint32_t counter = 0;
+	    static uint32_t last_save = 0;
 
-	  // Инициализация NOR Flash
-	  osDelay(1000);
-	  strcpy(msg, "Initializing NOR Flash...\r\n");
-	  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+	    // Инициализация NOR Flash
+	    osDelay(1000);
+	    strcpy(msg, "Initializing NOR Flash...\r\n");
+	    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
 
-	  nor_err_e nor_result = nor_init();
-	  if (nor_result != NOR_OK) {
-	      snprintf(msg, sizeof(msg), "NOR Init failed: %d\r\n", nor_result);
-	      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
-	      vTaskDelete(NULL);
-	      return;
-	  }
+	    nor_err_e nor_result = nor_init();
+	    if (nor_result != NOR_OK) {
+	        snprintf(msg, sizeof(msg), "NOR Init failed: %d\r\n", nor_result);
+	        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+	        vTaskDelete(NULL);
+	        return;
+	    }
 
-	  snprintf(msg, sizeof(msg), "NOR Flash ID: 0x%06lX\r\n", nor_flash.info.u32JedecID);
-	  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+	    snprintf(msg, sizeof(msg), "NOR Flash ID: 0x%06lX\r\n", nor_flash.info.u32JedecID);
+	    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
 
-	  // Монтирование LittleFS
-	  strcpy(msg, "Mounting LittleFS...\r\n");
-	  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+	    // Монтирование LittleFS с повторными попытками
+	    strcpy(msg, "Mounting LittleFS...\r\n");
+	    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
 
-	  littlefs_config_init();
-	  err = lfs_mount(&lfs, &cfg);
-	  if (err != LFS_ERR_OK) {
-	      strcpy(msg, "Formatting...\r\n");
-	      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
-	      lfs_format(&lfs, &cfg);
-	      lfs_mount(&lfs, &cfg);
-	  }
+	    littlefs_config_init();
 
-	  // Создание структуры директорий
-	  lfs_mkdir(&lfs, "data");
-	  strcpy(msg, "=== LittleFS Ready ===\r\n");
-	  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+	    // Пытаемся монтировать несколько раз
+	    for(int retry = 0; retry < 3; retry++) {
+	        err = lfs_mount(&lfs, &cfg);
+	        if (err == LFS_ERR_OK) {
+	            break;
+	        }
+	        snprintf(msg, sizeof(msg), "Mount failed (%d), formatting...\r\n", err);
+	        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
 
-	  // Основной цикл задачи
+	        lfs_format(&lfs, &cfg);
+	        osDelay(100);
+	    }
+
+	    // Проверяем успешность монтирования
+	    if (err != LFS_ERR_OK) {
+	        strcpy(msg, "LittleFS mount FAILED!\r\n");
+	        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+	        vTaskDelete(NULL);
+	        return;
+	    }
+
+	    // Создание структуры директорий
+	    lfs_mkdir(&lfs, "/data");
+
+	    // Тестируем запись сразу
+	    lfs_file_t test_file;
+	    if (lfs_file_open(&lfs, &test_file, "/data/test.txt", LFS_O_WRONLY | LFS_O_CREAT) == LFS_ERR_OK) {
+	        const char *test_msg = "LittleFS test successful!\r\n";
+	        lfs_file_write(&lfs, &test_file, test_msg, strlen(test_msg));
+	        lfs_file_close(&lfs, &test_file);
+	        strcpy(msg, "LittleFS test write: OK\r\n");
+	    } else {
+	        strcpy(msg, "LittleFS test write: FAILED\r\n");
+	    }
+	    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+
+	    strcpy(msg, "=== LittleFS Ready ===\r\n");
+	    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
   /* Infinite loop */
   for(;;)
   {
-	     char status_msg[128];
+        char status_msg[128];
 
-	      // Обработка команд UART
-	      if (huart2.RxState == HAL_UART_STATE_READY) {
-	          uint8_t cmd;
-	          if (HAL_UART_Receive(&huart2, &cmd, 1, 10) == HAL_OK) {
-	              switch(cmd) {
-	                  case 'l': // Листинг файлов
-	                      list_files("/");
-	                      osDelay(1);
-	                      list_files("/data");
-	                      osDelay(1);
-	                      break;
+        // Обработка команд UART
+        if (huart2.RxState == HAL_UART_STATE_READY) {
+            uint8_t cmd;
+            if (HAL_UART_Receive(&huart2, &cmd, 1, 10) == HAL_OK) {
+                switch(cmd) {
+                    case 'l': // Листинг файлов
+                        list_files("/");
+                        osDelay(1);
+                        list_files("/data");
+                        osDelay(1);
+                        break;
 
-	                  case 's': // Статус системы
-	                      snprintf(status_msg, sizeof(status_msg),
-	                               "Status - Counter: %lu, NOR ID: 0x%06lX\r\n",
-	                               counter, nor_flash.info.u32JedecID);
-	                      HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
-	                      osDelay(1);
-	                      break;
+                    case 's': // Статус системы
+                        snprintf(status_msg, sizeof(status_msg),
+                                 "Status - Counter: %lu, NOR ID: 0x%06lX\r\n",
+                                 counter, nor_flash.info.u32JedecID);
+                        HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
+                        osDelay(1);
+                        break;
 
-	                  case 't': // Создание тестового файла
-	                      {
-	                          lfs_file_t test_file;
-	                          if (lfs_file_open(&lfs, &test_file, "/data/testfile.txt", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) == LFS_ERR_OK) {
-	                              const char *test_data = "Test file for LittleFS\r\n";
-	                              lfs_file_write(&lfs, &test_file, test_data, strlen(test_data));
-	                              lfs_file_close(&lfs, &test_file);
-	                              strcpy(status_msg, "Test file created\r\n");
-	                          } else {
-	                              strcpy(status_msg, "Failed to create test file\r\n");
-	                          }
-	                          HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
-	                          osDelay(1);
-	                      }
-	                      break;
+                    case 't': // Создание тестового файла
+                        {
+                            lfs_file_t test_file;
+                            if (lfs_file_open(&lfs, &test_file, "/data/testfile.txt", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC) == LFS_ERR_OK) {
+                                const char *test_data = "Test file for LittleFS\r\n";
+                                lfs_file_write(&lfs, &test_file, test_data, strlen(test_data));
+                                lfs_file_close(&lfs, &test_file);
+                                strcpy(status_msg, "Test file created\r\n");
+                            } else {
+                                strcpy(status_msg, "Failed to create test file\r\n");
+                            }
+                            HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
+                            osDelay(1);
+                        }
+                        break;
 
-	                  case 'c': // Принудительное сохранение счетчика
-	                      {
-	                          err = lfs_file_open(&lfs, &file, "/data/counter.txt", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
-	                          if (err == LFS_ERR_OK) {
-	                              char counter_str[20];
-	                              snprintf(counter_str, sizeof(counter_str), "%lu", counter);
-	                              lfs_file_write(&lfs, &file, counter_str, strlen(counter_str));
-	                              lfs_file_close(&lfs, &file);
-	                              snprintf(status_msg, sizeof(status_msg), "Counter saved: %lu\r\n", counter);
-	                          } else {
-	                              strcpy(status_msg, "Failed to save counter\r\n");
-	                          }
-	                          HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
-	                          last_save = counter;
-	                          osDelay(1);
-	                      }
-	                      break;
+                    case 'c': // Принудительное сохранение счетчика
+                        {
+                            err = lfs_file_open(&lfs, &file, "/data/counter.txt", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+                            if (err == LFS_ERR_OK) {
+                                char counter_str[20];
+                                snprintf(counter_str, sizeof(counter_str), "%lu", counter);
+                                lfs_file_write(&lfs, &file, counter_str, strlen(counter_str));
+                                lfs_file_close(&lfs, &file);
+                                snprintf(status_msg, sizeof(status_msg), "Counter saved: %lu\r\n", counter);
+                            } else {
+                                strcpy(status_msg, "Failed to save counter\r\n");
+                            }
+                            HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
+                            last_save = counter;
+                            osDelay(1);
+                        }
+                        break;
 
-	                  case 'h': // Справка
-	                      strcpy(status_msg,
-	                          "LittleFS Commands:\r\n"
-	                          "l - List files\r\n"
-	                          "s - System status\r\n"
-	                          "t - Create test file\r\n"
-	                          "c - Save counter now\r\n"
-	                          "h - Help\r\n");
-	                      HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
-	                      osDelay(1);
-	                      break;
+                    // НОВЫЕ КОМАНДЫ ДЛЯ РАБОТЫ С ФАЙЛАМИ
+                    case 'f': // Список файлов для передачи
+                        send_file_list();
+                        break;
 
-	                  default:
-	                      snprintf(status_msg, sizeof(status_msg), "Unknown: %c (use 'h')\r\n", cmd);
-	                      HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
-	                      osDelay(1);
-	                      break;
-	              }
-	          }
-	      }
+                    case 'x': // Отправить файл как бинарный (для Tera Term)
+                        {
+                            char filename[32];
+                            if (receive_filename(filename, sizeof(filename)) == 0) {
+                                send_file_teraterm(filename);
+                            }
+                        }
+                        break;
 
-	      // Автосохранение счетчика каждые 60 секунд
-	      if (counter - last_save >= 600) {
-	          last_save = counter;
-	          err = lfs_file_open(&lfs, &file, "/data/counter.txt", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
-	          if (err == LFS_ERR_OK) {
-	              char counter_str[20];
-	              snprintf(counter_str, sizeof(counter_str), "%lu", counter);
-	              lfs_file_write(&lfs, &file, counter_str, strlen(counter_str));
-	              lfs_file_close(&lfs, &file);
-	          }
-	          osDelay(1);
-	      }
+                    case 'h': // Отправить файл как hex dump
+                        {
+                            char filename[32];
+                            if (receive_filename(filename, sizeof(filename)) == 0) {
+                                send_file_hexdump(filename);
+                            }
+                        }
+                        break;
 
-	      counter++;
-	      osDelay(100); // Основная задержка задачи
+                    case 'r': // Принять файл из Tera Term
+                        {
+                            char filename[32];
+                            if (receive_filename(filename, sizeof(filename)) == 0) {
+                                receive_file_teraterm(filename);
+                            }
+                        }
+                        break;
+
+                    case 'L': // Start logging (uppercase L)
+                        start_logging();
+                        break;
+
+                    case 'S': // Stop logging (uppercase S)
+                        stop_logging();
+                        break;
+
+                    case 'X': // Send log file via XMODEM (uppercase X)
+                        send_log_file_xmodem();
+                        break;
+
+                    case 'i': // Set log interval
+                        {
+                            char interval_str[10];
+                            if (receive_filename(interval_str, sizeof(interval_str)) == 0) {
+                                log_interval_ms = atoi(interval_str);
+                                char msg[50];
+                                snprintf(msg, sizeof(msg), "Log interval set to: %lu ms\r\n", log_interval_ms);
+                                HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+                            }
+                        }
+                        break;
+
+                    case 'y': // Send file via YMODEM
+                        {
+                            send_file_ymodem_working();
+                        }
+                        break;
+
+                    case 'm': // Send file via XMODEM
+                        {
+                            char filename[32];
+                            if (receive_filename(filename, sizeof(filename)) == 0) {
+                                send_file_xmodem(filename);
+                            }
+                        }
+                        break;
+
+                    case 'H': // Check filesystem health
+                        check_filesystem_health();
+                        break;
+
+                    case '?': // Справка
+                        strcpy(status_msg,
+                            "=== DCDC Logger Commands ===\r\n"
+                        	"H - Check filesystem health\r\n"
+                            "L - Start logging Vout data\r\n"
+                            "S - Stop logging\r\n"
+                            "X - Send log file (XMODEM)\r\n"
+                            "i - Set log interval (ms)\r\n"
+                            "l - List files\r\n"
+                            "f - File list for transfer\r\n"
+                            "x - Send any file (XMODEM)\r\n"
+                            "y - Send ALL files (YMODEM)\r\n"
+                            "r - Receive file\r\n"
+                            "s - System status\r\n"
+                            "t - Create test file\r\n"
+                            "c - Save counter now\r\n"
+                            "? - Help\r\n");
+                        HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
+                        osDelay(1);
+                        break;
+                    default:
+                        snprintf(status_msg, sizeof(status_msg), "Unknown: %c (use '?' for help)\r\n", cmd);
+                        HAL_UART_Transmit(&huart2, (uint8_t*)status_msg, strlen(status_msg), 50);
+                        osDelay(1);
+                        break;
+                }
+            }
+        }
+
+        // Автосохранение счетчика каждые 60 секунд
+        if (counter - last_save >= 600) {
+            last_save = counter;
+            err = lfs_file_open(&lfs, &file, "/data/counter.txt", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+            if (err == LFS_ERR_OK) {
+                char counter_str[20];
+                snprintf(counter_str, sizeof(counter_str), "%lu", counter);
+                lfs_file_write(&lfs, &file, counter_str, strlen(counter_str));
+                lfs_file_close(&lfs, &file);
+            }
+            osDelay(1);
+        }
+
+        counter++;
+        osDelay(100); // Основная задержка задачи
   }
   /* USER CODE END Start_TaskLittleFS */
 }
@@ -996,6 +1725,22 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* USER CODE BEGIN Callback 1 */
   if (htim->Instance == TIM3)
   {
+		// Обновление ПИ-регулятора
+		control = PI_Update(&pi, Vref, Vout, DCDC_DT);
+
+		// Ограничение управляющего сигнала
+		if (control > DCDC_VIN) control = DCDC_VIN;
+		if (control < 0.0f)     control = 0.0f;
+
+		// Расчет скважности ШИМ
+		uint16_t duty = (uint16_t)((control / DCDC_VIN) * __HAL_TIM_GET_AUTORELOAD(&htim3));
+		duty_last = duty;
+
+		// Моделирование DCDC преобразователя и тепловых процессов
+		float P_heat = Vout * Vout / DCDC_RLOAD;
+		float P_cool = 0.1f * (Device_temp - 20.0f);
+		Device_temp += 100.0f * DCDC_DT * (P_heat - P_cool);
+		Vout += DCDC_DT * ((DCDC_VIN * duty / __HAL_TIM_GET_AUTORELOAD(&htim3)) - Vout / DCDC_RLOAD) / DCDC_C;
       __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, duty_last);
   }
   /* USER CODE END Callback 1 */
